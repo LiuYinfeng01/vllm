@@ -1,83 +1,76 @@
 group: Hardware - AMD Build
 
-# ROCm image flow:
-# 1. Select the content-matching ROCm base, building only on a cache miss.
-# 2. Build ci_base from either the stable base or the newly selected base.
-# 3. Build the build-scoped ROCm CI image and smoke-test it before GPU jobs run.
+# ROCm images: .buildkite/scripts/rocm/build.sh + docker/docker-bake-rocm.hcl. ci-infra's AMD CI pipeline
+# (test-template-amd.j2) renders these same steps and sets ROCM_CI_REPO (trusted rocm/vllm-ci, else rocm/vllm-dev).
+# The base step ensures the content-keyed stack (+ -wheels), runtime and test-deps images; the build
+# step adds the per-commit test image. Base groups are per stack/repo/PR/branch.
 steps:
-  - label: ":docker: Refresh ROCm base"
+  - label: ":docker: Ensure ROCm stack + runtime"
     key: refresh-rocm-base-amd
     depends_on: []
     device: amd_cpu
     no_plugin: true
     commands:
-      - bash .buildkite/scripts/rocm/refresh-base-image.sh
+      - bash .buildkite/scripts/rocm/build.sh rocm base
+    timeout_in_minutes: 540   # a key miss rebuilds the stack (hours); a hit takes seconds
     concurrency: 1
-    concurrency_group: "vllm/rocm/base-build/$BUILDKITE_COMMIT"
-    env:
-      DOCKER_BUILDKIT: "1"
-      BUILDKIT_PROGRESS: "tty"
-      TERM: "xterm-256color"
+    concurrency_group: "vllm/rocm/base/rocm/$ROCM_CI_REPO/$BUILDKITE_PULL_REQUEST/$BUILDKITE_BRANCH"
     retry:
       automatic:
-        - exit_status: 1  # Transient Docker/BuildKit failure
+        - exit_status: 75  # Registry error (build.sh)
           limit: 1
         - exit_status: -1  # Agent was lost
           limit: 1
         - exit_status: -10  # Agent was lost
           limit: 1
 
-  # Ensure ci_base is up-to-date before building the test image.
-  # Compares a content hash of ci_base-affecting files against the remote
-  # image label. If hashes match the build is skipped (< 30 s); if they
-  # differ ci_base is rebuilt and pushed automatically.
-  - label: ":docker: Ensure ROCm ci_base"
-    key: ensure-ci-base-amd
-    soft_fail: false
+  - label: ":amd: (MI300) FlyDSL MXFP4 dependency and Quark loading"
+    key: aiter-flydsl-mxfp4-gfx942-amd
+    depends_on:
+      - image-build-amd
+    device: mi300_1
+    num_devices: 1
+    dind: false
+    optional: false
+    timeout_in_minutes: 30
+    working_dir: /vllm-workspace/
+    source_file_dependencies:
+      - .buildkite/hardware_tests/amd.yaml
+      - tests/kernels/moe/test_ocp_mx_moe.py
+      - vllm/model_executor/layers/fused_moe/
+      - vllm/model_executor/layers/quantization/quark/
+      - vllm/config/kernel.py
+      - vllm/_aiter_ops.py
+    commands:
+      - |
+        set -euo pipefail
+        test_root=$(mktemp -d)
+        trap 'rm -rf "$test_root"' EXIT
+        uv venv --system-site-packages \
+          --python "${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/}python" "$test_root/venv"
+        test_python="$test_root/venv/bin/python"
+        export VLLM_ROCM_USE_AITER=0 VLLM_ROCM_USE_AITER_MOE=0
+        export VLLM_GPU_SYNC_CHECK=error
+        "$test_python" -c 'from vllm.platforms.rocm import on_gfx942; assert on_gfx942()'
+        "$test_python" -m pytest -v -s tests/kernels/moe/test_ocp_mx_moe.py -k aiter_flydsl
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx942 PREBUILD_KERNELS=0 uv pip install \
+          --python "$test_python" --target "$test_root/dependencies" \
+          --no-deps --no-build-isolation \
+          'amd-aiter @ git+https://github.com/ROCm/aiter.git@f52deefccdb66c410b337a2947050b228a55e547' \
+          'flydsl==0.4.0'
+        export PYTHONPATH="$test_root/dependencies:${PYTHONPATH:-.}"
+        "$test_python" -c 'from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_moe; assert callable(flydsl_a16w4_moe)'
+        "$test_python" -m pytest -v -s tests/kernels/moe/test_ocp_mx_moe.py -k aiter_flydsl
+
+  - label: ":docker: Build ROCm test image"
+    key: image-build-amd
     depends_on:
       - refresh-rocm-base-amd
     device: amd_cpu
     no_plugin: true
     commands:
-      - bash .buildkite/scripts/rocm/build-ci-base.sh
-    concurrency: 1
-    concurrency_group: "vllm/rocm/ci-base-build/$BUILDKITE_COMMIT"
-    env:
-      DOCKER_BUILDKIT: "1"
-      BUILDKIT_PROGRESS: "tty"
-      TERM: "xterm-256color"
-      VLLM_BAKE_FILE: "docker/docker-bake-rocm.hcl"
-      PYTORCH_ROCM_ARCH: "gfx90a;gfx942;gfx950"
-      REMOTE_VLLM: "0"
-    retry:
-      automatic:
-        - exit_status: 1  # Transient Docker/BuildKit failure
-          limit: 1
-        - exit_status: 2  # Exact image found but registry handoff failed
-          limit: 1
-        - exit_status: -1  # Agent was lost
-          limit: 1
-        - exit_status: -10  # Agent was lost
-          limit: 1
-
-  - label: ":docker: Build ROCm test image and artifacts"
-    key: image-build-amd
-    soft_fail: false
-    depends_on:
-      - ensure-ci-base-amd
-    device: amd_cpu
-    no_plugin: true
-    commands:
-      - bash .buildkite/scripts/rocm/build-test-image.sh
-      - bash .buildkite/scripts/rocm/smoke-test-image.sh
-    env:
-      DOCKER_BUILDKIT: "1"
-      BUILDKIT_PROGRESS: "tty"
-      TERM: "xterm-256color"
-      VLLM_BAKE_FILE: "docker/docker-bake-rocm.hcl"
-      PYTORCH_ROCM_ARCH: "gfx90a;gfx942;gfx950"
-      IMAGE_TAG: "rocm/vllm-ci:build-$BUILDKITE_BUILD_ID"
-      REMOTE_VLLM: "0"
+      - bash .buildkite/scripts/rocm/build.sh rocm ci
+    timeout_in_minutes: 180
     retry:
       automatic:
         - exit_status: 1  # Transient Docker/BuildKit failure

@@ -82,6 +82,19 @@ if triton_kernels_version is not None:
         )
 
 
+def store_params_in_triton(layer: torch.nn.Module, **tensors) -> None:
+    """Back each loaded param and its triton_kernels tensor by one storage, so the
+    param keeps its loaded bytes without a second copy of the data."""
+    for name, tensor in tensors.items():
+        replace_parameter(layer, name, tensor.storage.data)
+        tensor.storage.data = getattr(layer, name).data
+
+
+def triton_weight(layer: torch.nn.Module, name: str):
+    """The triton_kernels tensor stored for weight `name`, else the param."""
+    return getattr(layer, f"{name}_triton", getattr(layer, name))
+
+
 def _pack_deepgemm_mxfp4_scales(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
@@ -148,6 +161,7 @@ class Mxfp4MoeBackend(Enum):
     MARLIN = "MARLIN"
     # ROCm AITER backends
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel (gfx950)
+    AITER_FLYDSL_MXFP4_BF16 = "AITER_FLYDSL_MXFP4_BF16"
     # Legacy alias, resolves to the CK kernel. New code should name either
     # AITER_MXFP4_BF16 (CK) or AITER_TRITON_MXFP4_BF16 (Triton) explicitly.
     AITER = "AITER_MXFP4_BF16"
@@ -293,6 +307,13 @@ def backend_to_kernel_cls(
 
         return [AiterMxfp4Experts]
 
+    elif backend == Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16:
+        from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+            AiterFlydslMxfp4Experts,
+        )
+
+        return [AiterFlydslMxfp4Experts]
+
     elif backend == Mxfp4MoeBackend.AITER_TRITON_MXFP4_BF16:
         from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a16_moe import (
             AiterW4A16ExpertsMonolithic,
@@ -383,6 +404,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
             Mxfp4MoeBackend.AITER_TRITON_MXFP4_MXFP4,
         ],
+        "aiter_flydsl_mxfp4_bf16": [Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16],
         "aiter_triton_mxfp4_bf16": [Mxfp4MoeBackend.AITER_TRITON_MXFP4_BF16],
         "aiter_mxfp4_fp8": [Mxfp4MoeBackend.AITER_MXFP4_FP8],
         "aiter_triton_mxfp4_mxfp4": [Mxfp4MoeBackend.AITER_TRITON_MXFP4_MXFP4],
@@ -423,10 +445,14 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.CPU,
         Mxfp4MoeBackend.EMULATION,
     ]
-    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
-        # Consumer Blackwell: the OAI Triton kernels run but their 99KB shared
-        # memory budget caps them at small tiles, so MARLIN prefills ~10%
-        # faster at equal decode throughput. Keep TRITON as an opt-in.
+    if current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(110)
+        or current_platform.is_device_capability_family(120)
+    ):
+        # Keep TRITON as an opt-in. Consumer Blackwell: the OAI Triton kernels
+        # run but their 99KB shared memory budget caps them at small tiles, so
+        # MARLIN prefills ~10% faster at equal decode throughput. Jetson Thor
+        # (SM110): MARLIN stays the default as it has not been benchmarked.
         _AVAILABLE_BACKENDS.remove(Mxfp4MoeBackend.TRITON)
         _AVAILABLE_BACKENDS.insert(
             _AVAILABLE_BACKENDS.index(Mxfp4MoeBackend.BATCHED_MARLIN) + 1,
@@ -841,6 +867,8 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     activation: MoEActivation | None = None,
 ) -> tuple[int, int]:
     """Round up hidden_size and intermediate_size based on backend requirements."""
+    if backend == Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16:
+        return round_up(hidden_size, 256), round_up(intermediate_size, 128)
     if backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
         # The megakernel takes the model's dimensions and validates them itself.
         return hidden_size, intermediate_size
@@ -950,6 +978,19 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     torch.Tensor | None,
 ]:
     """Convert loaded weights into backend-specific kernel format."""
+    if mxfp4_backend == Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16:
+        return convert_weight_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=mxfp4_backend,
+            layer=layer,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_scale=w13_weight_scale,
+            w2_weight_scale=w2_weight_scale,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            activation=layer.activation,
+        )
+
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(
             w13_weight,
@@ -1429,8 +1470,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             flex_ctx=FlexCtx(rhs_data=w2_flex, lhs_data=lhs_data2),
         )
 
-        del layer.w13_weight
-        del layer.w2_weight
+        store_params_in_triton(layer, w13_weight=w13_weight, w2_weight=w2_weight)
 
         return (
             w13_weight,
@@ -1463,13 +1503,14 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             **_mx_scale_kwargs(w2_scale), flex_ctx=FlexCtx(rhs_data=w2_flex)
         )
 
-        # The original mxfp4 block scales have been swizzled into the
-        # precision configs above and are no longer read by the kernel, so
-        # drop the now-dead weight/scale Parameters to free their memory.
-        del layer.w13_weight
-        del layer.w2_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight_scale
+        # The swizzled weights and scales live in the params' storage.
+        store_params_in_triton(
+            layer,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_scale=w13_scale,
+            w2_weight_scale=w2_scale,
+        )
 
         return (
             w13_weight,
@@ -1579,6 +1620,33 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     Supports CUTLASS, DeepGEMM, FlashInfer, TRTLLM MXFP8, Triton and Marlin
     backends.
     """
+    if mxfp4_backend == Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16:
+        if (
+            activation != MoEActivation.SILU
+            or w13_bias is not None
+            or w2_bias is not None
+        ):
+            raise ValueError("AITER FlyDSL MXFP4 requires SiLU experts without bias")
+        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+        num_experts = w13_weight.shape[0]
+        return (
+            shuffle_weight_a16w4(w13_weight.data.view(torch.uint8), 16, False),
+            shuffle_weight_a16w4(w2_weight.data.view(torch.uint8), 16, False),
+            shuffle_scale_a16w4(
+                w13_weight_scale.data.view(torch.uint8).flatten(0, 1),
+                num_experts,
+                False,
+            ),
+            shuffle_scale_a16w4(
+                w2_weight_scale.data.view(torch.uint8).flatten(0, 1),
+                num_experts,
+                False,
+            ),
+            None,
+            None,
+        )
+
     is_gfx1250 = False
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx1250
@@ -1925,13 +1993,14 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             **_mx_scale_kwargs(w2_scale), flex_ctx=FlexCtx(rhs_data=w2_flex)
         )
 
-        # The original mxfp4 block scales have been swizzled into the
-        # precision configs above and are no longer read by the kernel, so
-        # drop the now-dead weight/scale Parameters to free their memory.
-        del layer.w13_weight
-        del layer.w2_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight_scale
+        # The swizzled weights and scales live in the params' storage.
+        store_params_in_triton(
+            layer,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_scale=w13_scale,
+            w2_weight_scale=w2_scale,
+        )
 
         return (
             w13_weight,
@@ -2187,6 +2256,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
+        Mxfp4MoeBackend.AITER_FLYDSL_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_TRITON_MXFP4_BF16,
         Mxfp4MoeBackend.CPU,
     ):
