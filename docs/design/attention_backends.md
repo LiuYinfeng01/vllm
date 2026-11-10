@@ -105,6 +105,19 @@ vllm serve google/gemma-4-31B-it \
     --attention-backend TRITON_FLASHINFER
 ```
 
+### DeepSeek-V4.1 ROCm Decode Metadata
+
+On gfx942 (MI300X and MI325X), `ROCM_FLASHMLA_SPARSE_DSV41` uses the fused
+sliding-window metadata builder automatically for causal decode-only batches
+of at most 32 token rows. This does not require `--monokernel` and does not
+enable mono attention, top-k selection, or speculative sampling.
+
+Prefill, mixed batches, larger decode batches, padded slot mappings, and
+prefill context parallelism use the regular builder. Non-causal draft metadata
+and gfx950 retain their existing `--monokernel` requirement. The fusion writes
+the same integer indices, lengths, and graph buffers; attention arithmetic and
+activation precision are unchanged.
+
 ### Manual Selection
 
 When you explicitly set a backend via `--attention-backend` or `AttentionConfig`:

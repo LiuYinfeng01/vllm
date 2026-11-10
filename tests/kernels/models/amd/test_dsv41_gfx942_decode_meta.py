@@ -198,6 +198,128 @@ def test_swa_decode_meta_matches_vllm_ops(noncausal):
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 8, 32, 33])
+def test_swa_builder_without_mono_matches_vllm_ops(num_tokens):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_vllm_config,
+    )
+    from vllm.models.deepseek_v41.amd import ops, rocm
+    from vllm.models.deepseek_v41.amd.ops import swa_decode_meta
+    from vllm.platforms.rocm import on_gfx942
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    if not on_gfx942():
+        pytest.skip("ordinary decode SWA fusion is enabled only on gfx942")
+    config = create_vllm_config(
+        max_model_len=4096,
+        block_size=128,
+        max_num_seqs=64,
+        max_num_batched_tokens=64,
+        hf_config_override={"sliding_window": WINDOW, "compress_ratios": [0, 1, 2]},
+    )
+    assert not config.kernel_config.monokernel
+    ops.record_monokernel(config)
+    device = torch.device("cuda")
+    builder = rocm.DeepseekV41ROCMAiterSparseSWAMetadataBuilder(
+        SlidingWindowMLASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=WINDOW,
+            model_version="deepseek_v4",
+        ),
+        ["layer0"],
+        config,
+        device,
+    )
+    batch = create_common_attn_metadata(
+        BatchSpec([256 + row for row in range(num_tokens)], [1] * num_tokens),
+        128,
+        device,
+        arange_block_indices=True,
+    )
+    fused = swa_decode_meta.build(
+        builder, 0, batch, False, None, rocm.DeepseekV41ROCMAiterSparseSWAMetadata
+    )
+    assert (fused is not None) == (num_tokens <= 32)
+    assert not ops.enabled()
+    assert not ops.monokernel_cdna3_or_4()
+    buffers = _swa_buffers(WINDOW, False)
+    reference_inputs = dict(
+        n=num_tokens,
+        block_size=128,
+        slot_mapping=batch.slot_mapping,
+        query_start_loc=batch.query_start_loc,
+        seq_lens=batch.seq_lens,
+        token_to_req=torch.arange(num_tokens, device=device, dtype=torch.int32),
+        block_table=batch.block_table_tensor,
+        replay_start=builder.no_replay_start,
+    )
+    for _ in range(3):
+        builder.build(0, batch)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata = builder.build(0, batch)
+    assert metadata.decode_swa_ragged_indices is not None
+    assert batch.seq_lens_cpu_upper_bound is not None
+    pointer = metadata.decode_swa_ragged_indices.data_ptr()
+    for replay in range(3):
+        batch.slot_mapping.fill_(-1 if replay == 1 else 1)
+        batch.seq_lens.sub_(1)
+        batch.seq_lens_cpu_upper_bound.sub_(1)
+        batch.block_table_tensor.add_(1)
+        builder.decode_swa_lens.fill_(-7)
+        graph.replay()
+        _swa_old_ops(reference_inputs, buffers)
+        nnz = int(buffers["indptr"][num_tokens])
+        for actual, expected in (
+            (metadata.is_valid_token, buffers["is_valid"][:num_tokens]),
+            (metadata.decode_swa_indices, buffers["indices"][:num_tokens]),
+            (metadata.decode_swa_lens, buffers["lens"][:num_tokens]),
+            (metadata.decode_swa_ragged_indptr, buffers["indptr"][: num_tokens + 1]),
+            (metadata.decode_swa_ragged_indices[:nnz], buffers["ragged"][:nnz]),
+        ):
+            assert torch.equal(actual, expected)
+        assert not builder.decode_swa_lens[num_tokens:].any()
+        assert metadata.decode_swa_ragged_indices.data_ptr() == pointer
+    for query_lens in ([2], [1, 2]):
+        unsupported = create_common_attn_metadata(
+            BatchSpec([256] * len(query_lens), query_lens), 128, device
+        )
+        assert (
+            swa_decode_meta.build(
+                builder,
+                0,
+                unsupported,
+                False,
+                None,
+                rocm.DeepseekV41ROCMAiterSparseSWAMetadata,
+            )
+            is None
+        )
+    for unsupported in (
+        batch.replace(
+            slot_mapping=torch.cat((batch.slot_mapping, batch.slot_mapping[:1]))
+        ),
+        batch.replace(causal=False),
+    ):
+        assert (
+            swa_decode_meta.build(
+                builder,
+                0,
+                unsupported,
+                False,
+                None,
+                rocm.DeepseekV41ROCMAiterSparseSWAMetadata,
+            )
+            is None
+        )
+
+
 def _topk_case(
     g, max_rows
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:

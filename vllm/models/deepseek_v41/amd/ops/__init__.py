@@ -10,8 +10,8 @@ decode steps. `topk_pack` and `swa_decode_meta` build the decode
 attention metadata, `fused_markov` is DSpark's Markov sampling in one
 launch, and `draft_lm_head` keeps the DSpark draft's 5-row logits GEMM off
 wvSplitK. All of them run only when `enabled()` is true, except
-`swa_decode_meta` and `fused_markov`, which run when
-`monokernel_cdna3_or_4()` is true.
+`fused_markov`, which uses `monokernel_cdna3_or_4()`, and `swa_decode_meta`,
+whose causal gfx942 metadata path also runs without the mono decode layer.
 """
 
 import functools
@@ -32,6 +32,7 @@ def record_monokernel(vllm_config) -> None:
     _monokernel = bool(vllm_config.kernel_config.monokernel)
     enabled.cache_clear()
     monokernel_cdna3_or_4.cache_clear()
+    swa_decode_meta_enabled.cache_clear()
 
 
 @functools.cache
@@ -56,3 +57,15 @@ def monokernel_cdna3_or_4() -> bool:
     from vllm.platforms.rocm import get_cdna_version
 
     return get_cdna_version() in (3, 4)
+
+
+@functools.cache
+def swa_decode_meta_enabled() -> bool:
+    """Enable SWA metadata on gfx942, or the existing CDNA3/4 mono path."""
+    if monokernel_cdna3_or_4():
+        return True
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import get_cdna_version
+
+    return get_cdna_version() == 3

@@ -22,9 +22,9 @@ The DSpark draft's 3 layers build their non-causal block the same way, with
 ComputeDSparkNoncausalSWAIndicesKernel in place of the window kernel. That
 is 3 more builds of 8 launches after every target step.
 
-On gfx942 and gfx950 with --monokernel
-(`ops.monokernel_cdna3_or_4()`), decode batches of up to MAX_ROWS rows,
-causal or the draft block, use it. Other batches take the rest of
+On gfx942, causal decode batches of up to MAX_ROWS rows use it without
+--monokernel. The existing mono path on gfx942 and gfx950 also handles the
+non-causal draft block. PCP and unsupported batches take the rest of
 DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build.
 tests/kernels/models/amd/test_dsv41_gfx942_decode_meta.py compares it with the vLLM ops
 that it replaces.
@@ -32,7 +32,10 @@ that it replaces.
 
 import torch
 
-from vllm.models.deepseek_v41.amd.ops import monokernel_cdna3_or_4
+from vllm.models.deepseek_v41.amd.ops import (
+    monokernel_cdna3_or_4,
+    swa_decode_meta_enabled,
+)
 from vllm.triton_utils import tl, triton
 
 # One program holds all rows of the batch in registers, as a ROWS x WIDTH
@@ -183,13 +186,15 @@ def build(builder, common_prefix_len, cam, fast_build, replay_start, metadata_cl
     """Return the ROCm SWA metadata of a decode batch, causal or the DSpark
     draft block, built with one launch, or None when the batch needs the rest
     of DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build."""
-    if not monokernel_cdna3_or_4():
+    if not 0 < cam.num_actual_tokens <= MAX_ROWS:
+        return None
+    if not swa_decode_meta_enabled() or builder.pcp_size > 1:
         return None
     from vllm.v1.attention.backends.mla import sparse_swa
     from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
     noncausal = not cam.causal
-    if noncausal and not builder.is_dspark:
+    if noncausal and (not monokernel_cdna3_or_4() or not builder.is_dspark):
         return None
     num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
         split_decodes_and_prefills(cam, decode_threshold=builder.decode_threshold)
