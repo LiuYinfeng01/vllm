@@ -735,12 +735,11 @@ def test_rocm_attention_takes_the_gfx942_indexer_with_the_flag(
 
 @pytest.mark.parametrize("monokernel", [True, False])
 @pytest.mark.parametrize("cdna", [3, 4])
-def test_swa_decode_meta_runs_on_cdna3_and_cdna4_with_the_flag(
-    monkeypatch, cdna, monokernel
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_swa_decode_meta_does_not_require_mono_on_cdna3(
+    monkeypatch, cdna, monokernel, pcp_size
 ):
-    """swa_decode_meta's kernel is plain Triton, so with --monokernel a decode
-    batch gets its SWA metadata from the one launch on CDNA4 (gfx950) as on
-    CDNA3 (gfx942). Without the flag, the builder keeps vLLM's build."""
+    """Ordinary CDNA3 decode uses SWA fusion without enabling mono sampling."""
     import vllm.platforms.rocm as rocm_platform
     from vllm.models.deepseek_v41.amd import ops, rocm
     from vllm.models.deepseek_v41.amd.ops import swa_decode_meta
@@ -755,6 +754,7 @@ def test_swa_decode_meta_runs_on_cdna3_and_cdna4_with_the_flag(
     )
     ints = lambda *shape: torch.zeros(shape, dtype=torch.int32)  # noqa: E731
     builder = SimpleNamespace(
+        pcp_size=pcp_size,
         decode_threshold=M,
         window_size=md.SWA_WIDTH,
         block_size=128,
@@ -785,10 +785,12 @@ def test_swa_decode_meta_runs_on_cdna3_and_cdna4_with_the_flag(
     out = swa_decode_meta.build(
         builder, 0, cam, False, None, rocm.DeepseekV41ROCMAiterSparseSWAMetadata
     )
+    assert ops.monokernel_cdna3_or_4() is monokernel
     # No later test may see this test's cached gate.
     ops.record_monokernel(_config(monokernel=False))
-    assert launches == ([False] if monokernel else [])
-    assert (out is not None) is monokernel
+    takes_fused = pcp_size == 1 and (cdna == 3 or monokernel)
+    assert launches == ([False] if takes_fused else [])
+    assert (out is not None) is takes_fused
 
 
 def test_dspark_speculator_asks_the_draft_model_first():
